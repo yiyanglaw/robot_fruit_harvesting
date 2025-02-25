@@ -20,12 +20,15 @@ clf_input_details = clf_interpreter.get_input_details()
 clf_output_details = clf_interpreter.get_output_details()
 clf_img_width, clf_img_height = clf_input_details[0]['shape'][1], clf_input_details[0]['shape'][2]
 
-# Open webcam
+# Open USB Camera (/dev/video0 is default for USB cameras on RPi)
 cap = cv2.VideoCapture(0)
+cap.set(3, 640)  # Width
+cap.set(4, 480)  # Height
 
 while cap.isOpened():
     ret, frame = cap.read()
     if not ret:
+        print("Failed to capture image")
         break
     
     h, w, _ = frame.shape
