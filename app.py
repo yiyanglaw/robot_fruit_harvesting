@@ -1,68 +1,77 @@
 import cv2
 import numpy as np
-import tensorflow.lite as tflite
+import tensorflow as tf
+from tensorflow.keras.preprocessing.image import img_to_array
 
-# Load TFLite object detection model
-od_interpreter = tflite.Interpreter(model_path="detect.tflite")
-od_interpreter.allocate_tensors()
+# Load YOLO
+net = cv2.dnn.readNet("yolov3.weights", "yolov3.cfg")
+layer_names = net.getLayerNames()
+out_layers = [layer_names[i - 1] for i in net.getUnconnectedOutLayers()]
+
+# Load COCO class labels
+with open("coco.names", "r") as f:
+    classes = [line.strip() for line in f.readlines()]
+
+# Load TFLite model
+interpreter = tf.lite.Interpreter(model_path="apple_classifier.tflite")
+interpreter.allocate_tensors()
 
 # Get input and output tensors details
-od_input_details = od_interpreter.get_input_details()
-od_output_details = od_interpreter.get_output_details()
-od_img_width, od_img_height = od_input_details[0]['shape'][1], od_input_details[0]['shape'][2]
+input_details = interpreter.get_input_details()
+output_details = interpreter.get_output_details()
 
-# Load TFLite classification model
-clf_interpreter = tflite.Interpreter(model_path="apple_classifier.tflite")
-clf_interpreter.allocate_tensors()
+img_width, img_height = input_details[0]['shape'][1], input_details[0]['shape'][2]
 
-# Get input and output tensors details
-clf_input_details = clf_interpreter.get_input_details()
-clf_output_details = clf_interpreter.get_output_details()
-clf_img_width, clf_img_height = clf_input_details[0]['shape'][1], clf_input_details[0]['shape'][2]
-
-# Open USB Camera (/dev/video0 is default for USB cameras on RPi)
+# Open webcam
 cap = cv2.VideoCapture(0)
-cap.set(3, 640)  # Width
-cap.set(4, 480)  # Height
 
 while cap.isOpened():
     ret, frame = cap.read()
     if not ret:
-        print("Failed to capture image")
         break
     
-    h, w, _ = frame.shape
-    resized_frame = cv2.resize(frame, (od_img_width, od_img_height))
-    input_data = np.expand_dims(resized_frame.astype(np.float32) / 255.0, axis=0)
-
-    # Run object detection
-    od_interpreter.set_tensor(od_input_details[0]['index'], input_data)
-    od_interpreter.invoke()
-    boxes = od_interpreter.get_tensor(od_output_details[0]['index'])[0]  # Bounding boxes
-    classes = od_interpreter.get_tensor(od_output_details[1]['index'])[0]  # Class IDs
-    scores = od_interpreter.get_tensor(od_output_details[2]['index'])[0]  # Confidence scores
+    frame = cv2.resize(frame, (300, 300))  # Keep frame size 300x300
+    height, width, channels = frame.shape
+    blob = cv2.dnn.blobFromImage(frame, 0.00392, (416, 416), swapRB=True, crop=False)
+    net.setInput(blob)
+    outs = net.forward(out_layers)
     
-    for i in range(len(scores)):
-        if scores[i] > 0.3:  # Confidence threshold
-            class_id = int(classes[i])
-            if class_id == 0:  # Assuming class 0 is 'apple'
-                y_min, x_min, y_max, x_max = boxes[i]
-                x, y, x_max, y_max = int(x_min * w), int(y_min * h), int(x_max * w), int(y_max * h)
-                
-                apple_img = frame[y:y_max, x:x_max]
-                apple_img = cv2.resize(apple_img, (clf_img_width, clf_img_height))
-                apple_img = apple_img.astype("float32") / 255.0
-                apple_img = np.expand_dims(apple_img, axis=0)
+    class_ids = []
+    confidences = []
+    boxes = []
+    
+    for out in outs:
+        for detection in out:
+            scores = detection[5:]
+            class_id = np.argmax(scores)
+            confidence = scores[class_id]
+            if confidence > 0.3 and classes[class_id] == "apple":
+                center_x, center_y, w, h = (detection[0:4] * np.array([width, height, width, height])).astype("int")
+                x = int(center_x - w / 2)
+                y = int(center_y - h / 2)
+                boxes.append([x, y, int(w), int(h)])
+                confidences.append(float(confidence))
+                class_ids.append(class_id)
+    
+    indexes = cv2.dnn.NMSBoxes(boxes, confidences, 0.5, 0.4)
+    
+    for i in range(len(boxes)):
+        if i in indexes:
+            x, y, w, h = boxes[i]
+            apple_img = frame[y:y+h, x:x+w]
+            apple_img = cv2.resize(apple_img, (img_width, img_height))  # Resize for TFLite model
+            apple_img = apple_img.astype("float32") / 255.0
+            apple_img = np.expand_dims(apple_img, axis=0)
 
-                # Run classification model
-                clf_interpreter.set_tensor(clf_input_details[0]['index'], apple_img)
-                clf_interpreter.invoke()
-                prediction = clf_interpreter.get_tensor(clf_output_details[0]['index'])
-                
-                label = "Ripe Apple" if np.argmax(prediction) == 0 else "Unripe Apple"
-                
-                cv2.rectangle(frame, (x, y), (x_max, y_max), (0, 255, 0), 2)
-                cv2.putText(frame, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            # Run inference with TFLite model
+            interpreter.set_tensor(input_details[0]['index'], apple_img)
+            interpreter.invoke()
+            prediction = interpreter.get_tensor(output_details[0]['index'])
+
+            label = "Ripe Apple" if np.argmax(prediction) == 0 else "Unripe Apple"
+
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            cv2.putText(frame, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
     
     cv2.imshow('Apple Detection', frame)
     
